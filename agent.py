@@ -4,6 +4,8 @@ import time
 
 import chess
 import chess.polyglot
+import numpy as np
+from numba import njit
 
 # Import time runs at the game start. 90s to import packages, build tables etc.
 
@@ -106,6 +108,156 @@ for _sq in range(64):
 # Passed pawn bonus by rank (white perspective: rank 0=rank1, rank 6=rank7)
 _PASSED_BONUS = [0, 10, 20, 35, 50, 75, 100, 0]
 
+# ---------------------------------------------------------------------------
+# Numpy arrays for the JIT evaluator.  Built once at import time.
+# ---------------------------------------------------------------------------
+
+# piece_vals[piece_type] — index 0 unused (empty square)
+_NP_PIECE_VALS = np.array([0, 100, 320, 330, 500, 900, 20000], dtype=np.int32)
+
+# PST lookup: _NP_PST_W[piece_type, square], _NP_PST_B[piece_type, square]
+_NP_PST_W = np.zeros((7, 64), dtype=np.int32)
+_NP_PST_B = np.zeros((7, 64), dtype=np.int32)
+for _pt in range(1, 7):
+    if _pt in PST_WHITE:
+        _NP_PST_W[_pt] = PST_WHITE[_pt]
+        _NP_PST_B[_pt] = PST_BLACK[_pt]
+
+# Passed-pawn span masks as int64 bitboards (same bit pattern as uint64)
+def _to_i64(x: int) -> np.int64:
+    return np.int64(x if x < (1 << 63) else x - (1 << 64))
+
+_NP_PASSED_W  = np.array([_to_i64(_PASSED_SPAN[1][sq]) for sq in range(64)], dtype=np.int64)
+_NP_PASSED_B  = np.array([_to_i64(_PASSED_SPAN[0][sq]) for sq in range(64)], dtype=np.int64)
+_NP_PASSED_BONUS = np.array(_PASSED_BONUS, dtype=np.int32)
+
+# Square bitmasks and file bitmasks as int64 (bitwise ops ignore the sign)
+_NP_BB_SQ    = np.array([_to_i64(1 << sq) for sq in range(64)], dtype=np.int64)
+_NP_BB_FILES = np.array([_to_i64(int(chess.BB_FILES[f])) for f in range(8)], dtype=np.int64)
+
+# Pre-allocated encoding buffers (reused every call to avoid heap churn)
+_enc_pieces   = np.zeros(64, dtype=np.int32)
+_enc_is_white = np.zeros(64, dtype=np.bool_)
+
+
+@njit(cache=False)
+def _jit_eval(
+    pieces:       np.ndarray,   # int32[64]  piece type per square (0=empty)
+    is_white:     np.ndarray,   # bool[64]   True if the piece is White's
+    turn_white:   np.bool_,     # True if White to move
+    w_pawns:      np.int64,     # bitboard
+    b_pawns:      np.int64,
+    w_king:       np.int32,     # square index, -1 if absent
+    b_king:       np.int32,
+    w_bishops:    np.int32,
+    b_bishops:    np.int32,
+    piece_vals:   np.ndarray,   # int32[7]
+    pst_w:        np.ndarray,   # int32[7, 64]
+    pst_b:        np.ndarray,
+    passed_w:     np.ndarray,   # int64[64]
+    passed_b:     np.ndarray,
+    passed_bonus: np.ndarray,   # int32[8]
+    bb_sq:        np.ndarray,   # int64[64]
+    bb_files:     np.ndarray,   # int64[8]
+) -> np.int32:
+    score      = np.int32(0)
+    pawn_score = np.int32(0)
+    w_file     = np.zeros(8, dtype=np.int32)
+    b_file     = np.zeros(8, dtype=np.int32)
+
+    # --- Material + PST, and per-file pawn counts + passed-pawn bonus ---
+    for sq in range(64):
+        pt = pieces[sq]
+        if pt == np.int32(0):
+            continue
+        v   = piece_vals[pt]
+        wh  = is_white[sq]
+        pst = pst_w[pt, sq] if wh else pst_b[pt, sq]
+        val = np.int32(v + pst)
+        if wh == turn_white:
+            score += val
+        else:
+            score -= val
+
+        if pt == np.int32(1):          # pawn
+            f = sq % 8
+            if wh:
+                w_file[f] += np.int32(1)
+                if (passed_w[sq] & b_pawns) == np.int64(0):
+                    pawn_score += passed_bonus[sq >> 3]
+            else:
+                b_file[f] += np.int32(1)
+                if (passed_b[sq] & w_pawns) == np.int64(0):
+                    pawn_score -= passed_bonus[np.int32(7) - (sq >> 3)]
+
+    # --- Doubled and isolated pawns ---
+    for f in range(8):
+        wc = w_file[f]
+        bc = b_file[f]
+        if wc > np.int32(1):
+            pawn_score -= np.int32(20) * (wc - np.int32(1))
+        if bc > np.int32(1):
+            pawn_score += np.int32(20) * (bc - np.int32(1))
+        adj_w = np.int64(0)
+        adj_b = np.int64(0)
+        if f > 0:
+            adj_w |= w_pawns & bb_files[f - 1]
+            adj_b |= b_pawns & bb_files[f - 1]
+        if f < 7:
+            adj_w |= w_pawns & bb_files[f + 1]
+            adj_b |= b_pawns & bb_files[f + 1]
+        if wc > np.int32(0) and adj_w == np.int64(0):
+            pawn_score -= np.int32(15) * wc
+        if bc > np.int32(0) and adj_b == np.int64(0):
+            pawn_score += np.int32(15) * bc
+
+    score += pawn_score if turn_white else -pawn_score
+
+    # --- King safety (pawn shield + open files) ---
+    ks = np.int32(0)
+
+    if w_king >= np.int32(0):
+        wkf = w_king % np.int32(8)
+        wkr = w_king // np.int32(8)
+        for df in range(-1, 2):
+            nf = wkf + np.int32(df)
+            if nf < np.int32(0) or nf > np.int32(7):
+                continue
+            if (w_pawns & bb_files[nf]) == np.int64(0):
+                ks -= np.int32(10)
+            nr1 = wkr + np.int32(1)
+            if nr1 <= np.int32(7) and (w_pawns & bb_sq[nr1 * np.int32(8) + nf]) != np.int64(0):
+                ks += np.int32(15)
+            nr2 = wkr + np.int32(2)
+            if nr2 <= np.int32(7) and (w_pawns & bb_sq[nr2 * np.int32(8) + nf]) != np.int64(0):
+                ks += np.int32(5)
+
+    if b_king >= np.int32(0):
+        bkf = b_king % np.int32(8)
+        bkr = b_king // np.int32(8)
+        for df in range(-1, 2):
+            nf = bkf + np.int32(df)
+            if nf < np.int32(0) or nf > np.int32(7):
+                continue
+            if (b_pawns & bb_files[nf]) == np.int64(0):
+                ks += np.int32(10)
+            nr1 = bkr - np.int32(1)
+            if nr1 >= np.int32(0) and (b_pawns & bb_sq[nr1 * np.int32(8) + nf]) != np.int64(0):
+                ks -= np.int32(15)
+            nr2 = bkr - np.int32(2)
+            if nr2 >= np.int32(0) and (b_pawns & bb_sq[nr2 * np.int32(8) + nf]) != np.int64(0):
+                ks -= np.int32(5)
+
+    score += ks if turn_white else -ks
+
+    # --- Bishop pair ---
+    bp = (np.int32(30) if w_bishops >= np.int32(2) else np.int32(0)) - \
+         (np.int32(30) if b_bishops >= np.int32(2) else np.int32(0))
+    score += bp if turn_white else -bp
+
+    return score
+
+
 EXACT, LOWER, UPPER = 0, 1, 2
 # Transposition table: zobrist_hash -> (depth, score, flag, best_move)
 TT: dict[int, tuple[int, int, int, chess.Move | None]] = {}
@@ -117,94 +269,41 @@ _nodes: int = 0
 _NODES_PER_CHECK = 2048
 
 
-def _pawn_eval(w_pawns: int, b_pawns: int) -> int:
-    """Pawn structure score from White's perspective."""
-    score = 0
-    for f in range(8):
-        file_bb = chess.BB_FILES[f]
-        wc = chess.popcount(w_pawns & file_bb)
-        bc = chess.popcount(b_pawns & file_bb)
-
-        # Doubled pawns: each extra pawn on the same file is a liability
-        if wc > 1:
-            score -= 20 * (wc - 1)
-        if bc > 1:
-            score += 20 * (bc - 1)
-
-        # Isolated pawns: no friendly pawn on an adjacent file
-        adj = (chess.BB_FILES[f - 1] if f > 0 else 0) | (chess.BB_FILES[f + 1] if f < 7 else 0)
-        if wc and not (w_pawns & adj):
-            score -= 15 * wc
-        if bc and not (b_pawns & adj):
-            score += 15 * bc
-
-    # Passed pawns: no enemy pawn can block or capture it on the way to promotion
-    for sq in chess.SquareSet(w_pawns):
-        if not (_PASSED_SPAN[1][sq] & b_pawns):
-            score += _PASSED_BONUS[chess.square_rank(sq)]
-    for sq in chess.SquareSet(b_pawns):
-        if not (_PASSED_SPAN[0][sq] & w_pawns):
-            score -= _PASSED_BONUS[7 - chess.square_rank(sq)]
-
-    return score
-
-
-def _king_safety(king_sq: int, friendly_pawns: int, dr: int) -> int:
-    """Pawn shield score for one king. dr=+1 for White (shield above), -1 for Black."""
-    f = chess.square_file(king_sq)
-    r = chess.square_rank(king_sq)
-    score = 0
-    for df in (-1, 0, 1):
-        nf = f + df
-        if not (0 <= nf <= 7):
-            continue
-        # Pawn on the first shield rank is worth more than one on the second
-        nr1 = r + dr
-        if 0 <= nr1 <= 7 and (friendly_pawns & chess.BB_SQUARES[chess.square(nf, nr1)]):
-            score += 15
-        nr2 = r + 2 * dr
-        if 0 <= nr2 <= 7 and (friendly_pawns & chess.BB_SQUARES[chess.square(nf, nr2)]):
-            score += 5
-        # Open file next to king is dangerous
-        if not (friendly_pawns & chess.BB_FILES[nf]):
-            score -= 10
-    return score
-
-
 def _evaluate(board: chess.Board) -> int:
-    """Material + PST + pawn structure + king safety + bishop pair, side-to-move perspective."""
-    turn = board.turn
-    score = 0
+    """Encode board in one piece_map pass, then dispatch to the JIT evaluator."""
+    _enc_pieces[:] = 0
+    _enc_is_white[:] = False
+    w_pawns_i = 0
+    b_pawns_i = 0
+    w_king_sq = -1
+    b_king_sq = -1
+    w_bishops = 0
+    b_bishops = 0
 
-    # Material + PST
     for sq, piece in board.piece_map().items():
-        v = _PIECE_VALUE[piece.piece_type]
-        pst = (PST_WHITE if piece.color == chess.WHITE else PST_BLACK)[piece.piece_type][sq]
-        score += (v + pst) if piece.color == turn else -(v + pst)
+        pt = piece.piece_type
+        wh = piece.color == chess.WHITE
+        _enc_pieces[sq]   = pt
+        _enc_is_white[sq] = wh
+        if pt == chess.PAWN:
+            if wh: w_pawns_i |= 1 << sq
+            else:  b_pawns_i |= 1 << sq
+        elif pt == chess.KING:
+            if wh: w_king_sq = sq
+            else:  b_king_sq = sq
+        elif pt == chess.BISHOP:
+            if wh: w_bishops += 1
+            else:  b_bishops += 1
 
-    # Pawn structure (doubled, isolated, passed)
-    w_pawns = int(board.pieces(chess.PAWN, chess.WHITE))
-    b_pawns = int(board.pieces(chess.PAWN, chess.BLACK))
-    pawn_score = _pawn_eval(w_pawns, b_pawns)
-    score += pawn_score if turn == chess.WHITE else -pawn_score
-
-    # King safety: pawn shield and open files near king
-    w_king = board.king(chess.WHITE)
-    b_king = board.king(chess.BLACK)
-    ks = 0
-    if w_king is not None:
-        ks += _king_safety(w_king, w_pawns, 1)
-    if b_king is not None:
-        ks -= _king_safety(b_king, b_pawns, -1)
-    score += ks if turn == chess.WHITE else -ks
-
-    # Bishop pair: two bishops complement each other well in open positions
-    w_bp = 30 if chess.popcount(int(board.pieces(chess.BISHOP, chess.WHITE))) >= 2 else 0
-    b_bp = 30 if chess.popcount(int(board.pieces(chess.BISHOP, chess.BLACK))) >= 2 else 0
-    bp = w_bp - b_bp
-    score += bp if turn == chess.WHITE else -bp
-
-    return score
+    return int(_jit_eval(
+        _enc_pieces, _enc_is_white, np.bool_(board.turn == chess.WHITE),
+        _to_i64(w_pawns_i), _to_i64(b_pawns_i),
+        np.int32(w_king_sq), np.int32(b_king_sq),
+        np.int32(w_bishops), np.int32(b_bishops),
+        _NP_PIECE_VALS, _NP_PST_W, _NP_PST_B,
+        _NP_PASSED_W, _NP_PASSED_B, _NP_PASSED_BONUS,
+        _NP_BB_SQ, _NP_BB_FILES,
+    ))
 
 
 def _capture_score(board: chess.Board, move: chess.Move) -> int:
@@ -392,3 +491,22 @@ def get_move(fen: str, time_left_ms: int) -> str:
             break
 
     return (best_move or moves[0]).uci()
+
+
+# ---------------------------------------------------------------------------
+# JIT warmup — runs inside the 90s init budget before the clock starts.
+# Numba compiles per unique argument-type signature; warm every type we'll
+# actually pass so the first real call is instant.
+# ---------------------------------------------------------------------------
+_enc_pieces[0]   = chess.KING;  _enc_is_white[0]  = True
+_enc_pieces[63]  = chess.KING;  _enc_is_white[63] = False
+_jit_eval(
+    _enc_pieces, _enc_is_white, np.bool_(True),
+    np.int64(0), np.int64(0), np.int32(0), np.int32(63),
+    np.int32(0), np.int32(0),
+    _NP_PIECE_VALS, _NP_PST_W, _NP_PST_B,
+    _NP_PASSED_W, _NP_PASSED_B, _NP_PASSED_BONUS,
+    _NP_BB_SQ, _NP_BB_FILES,
+)
+_enc_pieces[:]   = 0
+_enc_is_white[:] = False
