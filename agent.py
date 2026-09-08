@@ -109,7 +109,7 @@ _PASSED_BONUS = [0, 10, 20, 35, 50, 75, 100, 0]
 EXACT, LOWER, UPPER = 0, 1, 2
 # Transposition table: zobrist_hash -> (depth, score, flag, best_move)
 TT: dict[int, tuple[int, int, int, chess.Move | None]] = {}
-TT_MAX = 500_000
+TT_MAX = 1_000_000
 
 _deadline: float = 0.0
 _timeout: bool = False
@@ -235,6 +235,18 @@ def _quiescence(board: chess.Board, alpha: int, beta: int) -> int:
         _timeout = True
         return 0
 
+    # Read-only TT probe: if a main-search entry already covers this position, use it
+    zh = chess.polyglot.zobrist_hash(board)
+    cached = TT.get(zh)
+    if cached is not None:
+        _, tt_score, tt_flag, _ = cached
+        if tt_flag == EXACT:
+            return tt_score
+        if tt_flag == LOWER and tt_score >= beta:
+            return tt_score
+        if tt_flag == UPPER and tt_score <= alpha:
+            return tt_score
+
     stand_pat = _evaluate(board)
     if stand_pat >= beta:
         return beta
@@ -309,14 +321,16 @@ def _alpha_beta(board: chess.Board, depth: int, alpha: int, beta: int, ply: int)
         if alpha >= beta:
             break
 
-    if not _timeout and len(TT) < TT_MAX:
-        if best_score <= orig_alpha:
-            flag = UPPER
-        elif best_score >= beta:
-            flag = LOWER
-        else:
-            flag = EXACT
-        TT[zh] = (depth, best_score, flag, best_move)
+    if not _timeout:
+        flag = UPPER if best_score <= orig_alpha else (LOWER if best_score >= beta else EXACT)
+        existing = TT.get(zh)
+        if existing is None:
+            if len(TT) >= TT_MAX:
+                TT.clear()  # generation reset: evict everything rather than silently dropping
+            TT[zh] = (depth, best_score, flag, best_move)
+        elif depth >= existing[0] or flag == EXACT:
+            # depth-preferred: replace shallow entries; always keep exact scores
+            TT[zh] = (depth, best_score, flag, best_move)
 
     return best_score
 
