@@ -87,6 +87,25 @@ _PST_RAW: dict[int, list[int]] = {
 PST_WHITE: dict[int, list[int]] = {p: [t[sq ^ 56] for sq in range(64)] for p, t in _PST_RAW.items()}
 PST_BLACK: dict[int, list[int]] = {p: [t[sq] for sq in range(64)] for p, t in _PST_RAW.items()}
 
+# Passed pawn span: squares in front of a pawn (same + adjacent files) that must be
+# free of enemy pawns for the pawn to be "passed".
+# _PASSED_SPAN[color_int][square] — color_int: WHITE=1, BLACK=0
+_PASSED_SPAN: list[list[int]] = [[0] * 64, [0] * 64]
+for _sq in range(64):
+    _f, _r = chess.square_file(_sq), chess.square_rank(_sq)
+    _span_files = chess.BB_FILES[_f]
+    if _f > 0:
+        _span_files |= chess.BB_FILES[_f - 1]
+    if _f < 7:
+        _span_files |= chess.BB_FILES[_f + 1]
+    for _nr in range(_r + 1, 8):
+        _PASSED_SPAN[1][_sq] |= _span_files & chess.BB_RANKS[_nr]  # white looks up
+    for _nr in range(0, _r):
+        _PASSED_SPAN[0][_sq] |= _span_files & chess.BB_RANKS[_nr]  # black looks down
+
+# Passed pawn bonus by rank (white perspective: rank 0=rank1, rank 6=rank7)
+_PASSED_BONUS = [0, 10, 20, 35, 50, 75, 100, 0]
+
 EXACT, LOWER, UPPER = 0, 1, 2
 # Transposition table: zobrist_hash -> (depth, score, flag, best_move)
 TT: dict[int, tuple[int, int, int, chess.Move | None]] = {}
@@ -98,14 +117,93 @@ _nodes: int = 0
 _NODES_PER_CHECK = 2048
 
 
-def _evaluate(board: chess.Board) -> int:
-    """Material + PST score from the side-to-move's perspective."""
+def _pawn_eval(w_pawns: int, b_pawns: int) -> int:
+    """Pawn structure score from White's perspective."""
     score = 0
+    for f in range(8):
+        file_bb = chess.BB_FILES[f]
+        wc = chess.popcount(w_pawns & file_bb)
+        bc = chess.popcount(b_pawns & file_bb)
+
+        # Doubled pawns: each extra pawn on the same file is a liability
+        if wc > 1:
+            score -= 20 * (wc - 1)
+        if bc > 1:
+            score += 20 * (bc - 1)
+
+        # Isolated pawns: no friendly pawn on an adjacent file
+        adj = (chess.BB_FILES[f - 1] if f > 0 else 0) | (chess.BB_FILES[f + 1] if f < 7 else 0)
+        if wc and not (w_pawns & adj):
+            score -= 15 * wc
+        if bc and not (b_pawns & adj):
+            score += 15 * bc
+
+    # Passed pawns: no enemy pawn can block or capture it on the way to promotion
+    for sq in chess.SquareSet(w_pawns):
+        if not (_PASSED_SPAN[1][sq] & b_pawns):
+            score += _PASSED_BONUS[chess.square_rank(sq)]
+    for sq in chess.SquareSet(b_pawns):
+        if not (_PASSED_SPAN[0][sq] & w_pawns):
+            score -= _PASSED_BONUS[7 - chess.square_rank(sq)]
+
+    return score
+
+
+def _king_safety(king_sq: int, friendly_pawns: int, dr: int) -> int:
+    """Pawn shield score for one king. dr=+1 for White (shield above), -1 for Black."""
+    f = chess.square_file(king_sq)
+    r = chess.square_rank(king_sq)
+    score = 0
+    for df in (-1, 0, 1):
+        nf = f + df
+        if not (0 <= nf <= 7):
+            continue
+        # Pawn on the first shield rank is worth more than one on the second
+        nr1 = r + dr
+        if 0 <= nr1 <= 7 and (friendly_pawns & chess.BB_SQUARES[chess.square(nf, nr1)]):
+            score += 15
+        nr2 = r + 2 * dr
+        if 0 <= nr2 <= 7 and (friendly_pawns & chess.BB_SQUARES[chess.square(nf, nr2)]):
+            score += 5
+        # Open file next to king is dangerous
+        if not (friendly_pawns & chess.BB_FILES[nf]):
+            score -= 10
+    return score
+
+
+def _evaluate(board: chess.Board) -> int:
+    """Material + PST + pawn structure + king safety + bishop pair, side-to-move perspective."""
     turn = board.turn
+    score = 0
+
+    # Material + PST
     for sq, piece in board.piece_map().items():
         v = _PIECE_VALUE[piece.piece_type]
         pst = (PST_WHITE if piece.color == chess.WHITE else PST_BLACK)[piece.piece_type][sq]
         score += (v + pst) if piece.color == turn else -(v + pst)
+
+    # Pawn structure (doubled, isolated, passed)
+    w_pawns = int(board.pieces(chess.PAWN, chess.WHITE))
+    b_pawns = int(board.pieces(chess.PAWN, chess.BLACK))
+    pawn_score = _pawn_eval(w_pawns, b_pawns)
+    score += pawn_score if turn == chess.WHITE else -pawn_score
+
+    # King safety: pawn shield and open files near king
+    w_king = board.king(chess.WHITE)
+    b_king = board.king(chess.BLACK)
+    ks = 0
+    if w_king is not None:
+        ks += _king_safety(w_king, w_pawns, 1)
+    if b_king is not None:
+        ks -= _king_safety(b_king, b_pawns, -1)
+    score += ks if turn == chess.WHITE else -ks
+
+    # Bishop pair: two bishops complement each other well in open positions
+    w_bp = 30 if chess.popcount(int(board.pieces(chess.BISHOP, chess.WHITE))) >= 2 else 0
+    b_bp = 30 if chess.popcount(int(board.pieces(chess.BISHOP, chess.BLACK))) >= 2 else 0
+    bp = w_bp - b_bp
+    score += bp if turn == chess.WHITE else -bp
+
     return score
 
 
