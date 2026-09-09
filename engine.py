@@ -180,6 +180,22 @@ TT_SCORE = np.zeros(TT_SIZE, dtype=np.int32)
 KILLERS = np.zeros((MAX_PLY, 2), dtype=np.int64)
 HISTORY = np.zeros((12, 64), dtype=np.int64)
 
+# The platform hands over a bare FEN each move, so the position arrays carry no
+# history and the search cannot see a repetition coming. We keep it here: every
+# position get_move is asked about, plus the current search path, as a small
+# open-addressed table the jitted code can probe.
+REPEAT_BITS = 12
+REPEAT_SIZE = 1 << REPEAT_BITS
+REPEAT_MASK = np.uint64(REPEAT_SIZE - 1)
+REPEAT_KEY = np.zeros(REPEAT_SIZE, dtype=np.uint64)
+REPEAT_COUNT = np.zeros(REPEAT_SIZE, dtype=np.int64)
+SEEN_KEY = np.zeros(REPEAT_SIZE, dtype=np.uint64)
+SEEN_COUNT = np.zeros(REPEAT_SIZE, dtype=np.int64)
+
+# A draw is worth slightly less than nothing, so the engine does not repeat its
+# way out of a won position. Applied from the root player's point of view.
+CONTEMPT = 30
+
 
 def new_game() -> None:
     TT_KEY[:] = 0
@@ -189,6 +205,44 @@ def new_game() -> None:
     TT_SCORE[:] = 0
     KILLERS[:] = 0
     HISTORY[:] = 0
+    REPEAT_KEY[:] = 0
+    REPEAT_COUNT[:] = 0
+    SEEN_KEY[:] = 0
+    SEEN_COUNT[:] = 0
+
+
+@njit(cache=False)
+def repeat_slot(key):
+    """Open addressing with linear probing; the table is far larger than a game."""
+    slot = np.int64(key & REPEAT_MASK)
+    for _ in range(REPEAT_SIZE):
+        if REPEAT_KEY[slot] == key or REPEAT_COUNT[slot] == 0:
+            return slot
+        slot = (slot + 1) & np.int64(REPEAT_SIZE - 1)
+    return slot
+
+
+@njit(cache=False)
+def repeat_count(repeat_key, repeat_count_table, key):
+    slot = np.int64(key & REPEAT_MASK)
+    for _ in range(64):
+        if repeat_count_table[slot] == 0:
+            return 0
+        if repeat_key[slot] == key:
+            return repeat_count_table[slot]
+        slot = (slot + 1) & np.int64(REPEAT_SIZE - 1)
+    return 0
+
+
+@njit(cache=False)
+def repeat_bump(repeat_key, repeat_count_table, key, delta):
+    slot = np.int64(key & REPEAT_MASK)
+    for _ in range(64):
+        if repeat_count_table[slot] == 0 or repeat_key[slot] == key:
+            repeat_key[slot] = key
+            repeat_count_table[slot] += delta
+            return
+        slot = (slot + 1) & np.int64(REPEAT_SIZE - 1)
 
 
 @njit(cache=False)
@@ -293,7 +347,8 @@ def quiescence(bbs, state, alpha, beta, ply, move_stack, score_stack, undo_stack
 @njit(cache=False)
 def negamax(bbs, state, depth, alpha, beta, ply, move_stack, score_stack, undo_stack,
             counter, deadline, timed_out,
-            tt_key, tt_depth, tt_flag, tt_moves, tt_score, killers, history):
+            tt_key, tt_depth, tt_flag, tt_moves, tt_score, killers, history,
+            repeat_key, repeat_count_table, root_white):
     counter[0] += 1
     if counter[0] % NODES_PER_TIME_CHECK == 0:
         now = 0.0
@@ -305,10 +360,14 @@ def negamax(bbs, state, depth, alpha, beta, ply, move_stack, score_stack, undo_s
     if timed_out[0]:
         return 0
 
-    if state[bb.HALFMOVE] >= 100 and ply > 0:
-        return 0
-
     key = zobrist_jit(bbs, state)
+    if ply > 0:
+        if state[bb.HALFMOVE] >= 100:
+            return -CONTEMPT if (state[bb.SIDE] == 0) == root_white else CONTEMPT
+        if repeat_count(repeat_key, repeat_count_table, key) > 0:
+            # Seen before, in this game or on this line. The referee claims the
+            # third occurrence, so treat the second as the draw it will become.
+            return -CONTEMPT if (state[bb.SIDE] == 0) == root_white else CONTEMPT
     slot = np.int64(key & TT_MASK)
     tt_move = 0
     if tt_key[slot] == key:
@@ -346,6 +405,7 @@ def negamax(bbs, state, depth, alpha, beta, ply, move_stack, score_stack, undo_s
     best_score = -MATE - 1
     best_move = 0
     legal_moves = 0
+    repeat_bump(repeat_key, repeat_count_table, key, 1)
 
     for index in range(count):
         move = pick_move(moves, scores, count, index)
@@ -359,7 +419,8 @@ def negamax(bbs, state, depth, alpha, beta, ply, move_stack, score_stack, undo_s
             score = -negamax(bbs, state, depth - 1, -beta, -alpha, ply + 1,
                                          move_stack, score_stack, undo_stack, counter,
                                          deadline, timed_out,
-                    tt_key, tt_depth, tt_flag, tt_moves, tt_score, killers, history)
+                    tt_key, tt_depth, tt_flag, tt_moves, tt_score, killers, history,
+                    repeat_key, repeat_count_table, root_white)
         else:
             reduction = 0
             quiet = piece_on(bbs, (move >> 6) & 63, not white) < 0 and (move >> 12) & 7 == 0
@@ -367,15 +428,18 @@ def negamax(bbs, state, depth, alpha, beta, ply, move_stack, score_stack, undo_s
                 reduction = 1
             score = -negamax(bbs, state, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1,
                              move_stack, score_stack, undo_stack, counter, deadline, timed_out,
-                             tt_key, tt_depth, tt_flag, tt_moves, tt_score, killers, history)
+                             tt_key, tt_depth, tt_flag, tt_moves, tt_score, killers, history,
+                    repeat_key, repeat_count_table, root_white)
             if not timed_out[0] and score > alpha and (reduction > 0 or score < beta):
                 score = -negamax(bbs, state, depth - 1, -beta, -alpha, ply + 1,
                                              move_stack, score_stack, undo_stack, counter,
                                              deadline, timed_out,
-                    tt_key, tt_depth, tt_flag, tt_moves, tt_score, killers, history)
+                    tt_key, tt_depth, tt_flag, tt_moves, tt_score, killers, history,
+                    repeat_key, repeat_count_table, root_white)
         bb.unmake_jit(bbs, state, move, undo)
 
         if timed_out[0]:
+            repeat_bump(repeat_key, repeat_count_table, key, -1)
             return 0
         if score > best_score:
             best_score = score
@@ -392,6 +456,8 @@ def negamax(bbs, state, depth, alpha, beta, ply, move_stack, score_stack, undo_s
                 if attacker >= 0:
                     history[(0 if white else 6) + attacker][target] += depth * depth
             break
+
+    repeat_bump(repeat_key, repeat_count_table, key, -1)
 
     if legal_moves == 0:
         return -MATE + ply if checked else 0
@@ -419,7 +485,8 @@ def negamax(bbs, state, depth, alpha, beta, ply, move_stack, score_stack, undo_s
 @njit(cache=False)
 def search_root(bbs, state, max_depth, deadline, move_stack, score_stack, undo_stack,
                 counter, timed_out,
-                tt_key, tt_depth, tt_flag, tt_moves, tt_score, killers, history):
+                tt_key, tt_depth, tt_flag, tt_moves, tt_score, killers, history,
+                repeat_key, repeat_count_table, root_white):
     """Iterative deepening. Keeps the last completed depth's move when time runs out."""
     best_move = 0
     moves = move_stack[0]
@@ -459,15 +526,18 @@ def search_root(bbs, state, max_depth, deadline, move_stack, score_stack, undo_s
             if legal_moves == 1:
                 score = -negamax(bbs, state, depth - 1, -MATE - 1, -alpha, 1, move_stack,
                                  score_stack, undo_stack, counter, deadline, timed_out,
-                                 tt_key, tt_depth, tt_flag, tt_moves, tt_score, killers, history)
+                                 tt_key, tt_depth, tt_flag, tt_moves, tt_score, killers, history,
+                    repeat_key, repeat_count_table, root_white)
             else:
                 score = -negamax(bbs, state, depth - 1, -alpha - 1, -alpha, 1, move_stack,
                                  score_stack, undo_stack, counter, deadline, timed_out,
-                                 tt_key, tt_depth, tt_flag, tt_moves, tt_score, killers, history)
+                                 tt_key, tt_depth, tt_flag, tt_moves, tt_score, killers, history,
+                    repeat_key, repeat_count_table, root_white)
                 if not timed_out[0] and score > alpha:
                     score = -negamax(bbs, state, depth - 1, -MATE - 1, -alpha, 1, move_stack,
                                      score_stack, undo_stack, counter, deadline, timed_out,
-                    tt_key, tt_depth, tt_flag, tt_moves, tt_score, killers, history)
+                    tt_key, tt_depth, tt_flag, tt_moves, tt_score, killers, history,
+                    repeat_key, repeat_count_table, root_white)
             bb.unmake_jit(bbs, state, move, undo)
             if timed_out[0]:
                 break
@@ -499,6 +569,10 @@ def _stacks() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 def _run(position: bb.Position, budget_ms: int) -> tuple[int, int, int]:
     boards, state = position[0].copy(), position[1].copy()
+    root_white = bool(state[bb.SIDE] == 0)
+    # The search path starts from what the game has actually played through.
+    REPEAT_KEY[:] = SEEN_KEY
+    REPEAT_COUNT[:] = SEEN_COUNT
     move_stack, score_stack, undo_stack = _stacks()
     counter = np.zeros(1, dtype=np.int64)
     timed_out = np.zeros(1, dtype=np.int64)
@@ -506,6 +580,7 @@ def _run(position: bb.Position, budget_ms: int) -> tuple[int, int, int]:
     move, depth = search_root(
         boards, state, MAX_PLY - 2, deadline, move_stack, score_stack, undo_stack,
         counter, timed_out, TT_KEY, TT_DEPTH, TT_FLAG, TT_MOVE, TT_SCORE, KILLERS, HISTORY,
+        REPEAT_KEY, REPEAT_COUNT, root_white,
     )
     return int(move), int(counter[0]), int(depth)
 
@@ -522,3 +597,30 @@ def search_nodes(position: bb.Position, budget_ms: int) -> int:
 def search_verbose(position: bb.Position, budget_ms: int) -> tuple[str, int, int]:
     move, nodes, depth = _run(position, budget_ms)
     return (bb.move_uci(move) if move else ""), nodes, depth
+
+
+# A zobrist key is a full uint64 and overflows int64 crossing back into Python,
+# so the key never leaves the jitted layer.
+
+
+@njit(cache=False)
+def remember_jit(seen_key, seen_count, bbs, state):
+    repeat_bump(seen_key, seen_count, zobrist_jit(bbs, state), 1)
+
+
+@njit(cache=False)
+def times_seen_jit(seen_key, seen_count, bbs, state):
+    return repeat_count(seen_key, seen_count, zobrist_jit(bbs, state))
+
+
+def remember(position: bb.Position) -> None:
+    """Record a position the game has actually reached, as get_move is handed it."""
+    remember_jit(SEEN_KEY, SEEN_COUNT, position[0], position[1])
+
+
+def times_seen(position: bb.Position) -> int:
+    return int(times_seen_jit(SEEN_KEY, SEEN_COUNT, position[0], position[1]))
+
+
+def history_size() -> int:
+    return int((SEEN_COUNT != 0).sum())

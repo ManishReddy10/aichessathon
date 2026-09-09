@@ -1,6 +1,7 @@
 """The jitted evaluation and search, built on bitboard.py."""
 
 import chess
+import numpy as np
 import pytest
 
 import bitboard as bb
@@ -132,3 +133,39 @@ def test_search_is_much_faster_than_the_python_chess_engine() -> None:
     """The whole reason this module exists."""
     nodes = engine.search_nodes(bb.from_fen(FENS[2]), 1_000)
     assert nodes > 300_000, f"only {nodes:,} nodes in 1s -- no faster than python-chess"
+
+
+# --- repetition history ---------------------------------------------------
+
+WON_FOR_WHITE = "6k1/5ppp/8/8/8/8/5PPP/3QK3 w - - 0 1"
+
+
+def test_new_game_clears_the_position_history() -> None:
+    engine.remember(bb.from_fen(WON_FOR_WHITE))
+    engine.new_game()
+    assert engine.history_size() == 0
+
+
+def test_remember_counts_repeated_positions() -> None:
+    engine.new_game()
+    position = bb.from_fen(WON_FOR_WHITE)
+    engine.remember(position)
+    engine.remember(position)
+    assert engine.times_seen(position) == 2
+
+
+def test_search_avoids_returning_to_a_position_seen_twice() -> None:
+    """The bug that drew 38 of 200 won games: the engine cannot see game history."""
+    engine.new_game()
+    preferred = engine.search(bb.from_fen(WON_FOR_WHITE), 1_500)
+
+    engine.new_game()
+    after = bb.from_fen(WON_FOR_WHITE)
+    boards, state = after[0].copy(), after[1].copy()
+    undo = np.zeros(5, dtype=np.int64)
+    move = next(m for m in bb.generate_legal(after) if bb.move_uci(m) == preferred)
+    bb.make_jit(boards, state, move, undo)
+    engine.remember((boards, state))
+    engine.remember((boards, state))
+
+    assert engine.search(bb.from_fen(WON_FOR_WHITE), 1_500) != preferred
