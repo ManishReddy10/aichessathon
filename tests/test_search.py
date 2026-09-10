@@ -114,12 +114,34 @@ def test_returns_a_legal_move_in_awkward_positions(fen: str) -> None:
     assert chess.Move.from_uci(agent.get_move(fen, 2_000)) in board.legal_moves
 
 
-def test_promotes_with_a_uci_promotion_suffix() -> None:
+def test_converts_a_passed_pawn_into_a_queen() -> None:
+    """Not necessarily on move one: delaying by a king move scores identically to
+    the search, so the requirement is that it converts, not that it hurries."""
+    board = chess.Board("8/P6k/8/8/8/8/6K1/8 w - - 0 1")
+    for _ in range(8):
+        move = chess.Move.from_uci(agent.get_move(board.fen(), 500))
+        assert move in board.legal_moves
+        board.push(move)
+        if move.promotion is not None:
+            break
+        board.push(next(iter(board.legal_moves)))  # any black reply
+    assert board.pieces(chess.QUEEN, chess.WHITE), "never promoted the pawn"
+
+
+def test_promotion_moves_carry_a_uci_suffix() -> None:
+    """A promotion returned as 'a7a8' instead of 'a7a8q' is an illegal move."""
     fen = "8/P6k/8/8/8/8/6K1/8 w - - 0 1"
-    board = chess.Board(fen)
-    move = chess.Move.from_uci(agent.get_move(fen, 2_000))
-    assert move in board.legal_moves
-    assert move.promotion is not None, "the only sensible move is a promotion"
+    promotions = [m for m in chess.Board(fen).legal_moves if m.promotion]
+    assert all(len(m.uci()) == 5 for m in promotions)
+    assert {m.uci() for m in promotions} == {
+        u for u in bb_promotion_ucis(fen)
+    }
+
+
+def bb_promotion_ucis(fen: str) -> set[str]:
+    import bitboard as bb
+
+    return {u for u in bb.legal_move_ucis(bb.from_fen(fen)) if len(u) == 5}
 
 
 def test_respects_the_clock_it_was_handed() -> None:

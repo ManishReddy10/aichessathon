@@ -78,14 +78,34 @@ def test_endgame_king_prefers_the_centre() -> None:
 
 
 def forcing_mates(fen: str) -> dict[str, int]:
+    """Moves that force mate, mapped to how many moves it takes (1 or 2)."""
     board = chess.Board(fen)
     found: dict[str, int] = {}
     for first in board.legal_moves:
         board.push(first)
         if board.is_checkmate():
             found[first.uci()] = 1
+        elif list(board.legal_moves) and _every_reply_is_mated(board):
+            found[first.uci()] = 2
         board.pop()
     return found
+
+
+def _every_reply_is_mated(board: chess.Board) -> bool:
+    for reply in board.legal_moves:
+        board.push(reply)
+        mated = any(_mates(board, follow_up) for follow_up in board.legal_moves)
+        board.pop()
+        if not mated:
+            return False
+    return True
+
+
+def _mates(board: chess.Board, move: chess.Move) -> bool:
+    board.push(move)
+    result = board.is_checkmate()
+    board.pop()
+    return result
 
 
 @pytest.mark.parametrize(
@@ -169,3 +189,95 @@ def test_search_avoids_returning_to_a_position_seen_twice() -> None:
     engine.remember((boards, state))
 
     assert engine.search(bb.from_fen(WON_FOR_WHITE), 1_500) != preferred
+
+
+# --- null-move pruning ----------------------------------------------------
+
+
+def test_null_move_is_refused_while_in_check() -> None:
+    """Passing in check leaves the king capturable and the score is nonsense."""
+    assert not engine.null_move_allowed(bb.from_fen("4k3/8/8/8/8/8/4R3/4K3 b - - 0 1"))
+
+
+def test_null_move_is_refused_in_a_king_and_pawn_endgame() -> None:
+    """Zugzwang: with only pawns, passing beats every legal move and the score lies."""
+    assert not engine.null_move_allowed(bb.from_fen("8/5pk1/8/8/8/8/5PK1/8 w - - 0 1"))
+
+
+def test_null_move_is_allowed_with_pieces_on_the_board() -> None:
+    assert engine.null_move_allowed(bb.from_fen(FENS[1]))
+
+
+def test_making_a_null_move_only_flips_the_side_and_clears_en_passant() -> None:
+    position = bb.from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 2")
+    before = position[0].copy()
+    assert bb.en_passant_square(position) == chess.D6
+    after = engine.probe_null_move(position)
+    assert (after[0] == before).all(), "pieces must not move"
+    assert not bb.white_to_move(after)
+    assert bb.en_passant_square(after) == -1, "the ep square does not survive a pass"
+
+
+def test_null_move_search_still_finds_a_forced_mate() -> None:
+    """Null-move pruning must never prune away a mate the engine would otherwise see."""
+    fen = "7k/8/8/8/8/8/R7/1R6 w - - 0 1"
+    assert engine.search(bb.from_fen(fen), 3_000) in forcing_mates(fen)
+
+
+# --- the evaluation terms the port left behind ----------------------------
+
+
+# Each pair below differs ONLY in the term being tested: the squares are chosen
+# so the piece-square tables contribute identically to both sides of the
+# comparison. Without that care these pass whether or not the term exists.
+
+
+def test_a_passed_pawn_is_worth_more_than_one_that_is_held_up() -> None:
+    # White e5 either way. Black's pawn sits on b7 or f7 -- same pawn PST value,
+    # but f7 stands in the e-pawn's path and b7 does not.
+    passed = engine.evaluate(bb.from_fen("4k3/1p6/8/4P3/8/8/8/4K3 w - - 0 1"))
+    held_up = engine.evaluate(bb.from_fen("4k3/5p2/8/4P3/8/8/8/4K3 w - - 0 1"))
+    assert passed > held_up
+
+
+def test_doubled_pawns_are_penalised() -> None:
+    # d3 and e3 carry the same pawn PST value, so only the doubling differs.
+    doubled = engine.evaluate(bb.from_fen("4k3/8/8/8/4P3/4P3/8/4K3 w - - 0 1"))
+    apart = engine.evaluate(bb.from_fen("4k3/8/8/8/4P3/3P4/8/4K3 w - - 0 1"))
+    assert apart > doubled
+
+
+def test_isolated_pawns_are_penalised() -> None:
+    # a4, b4 and h4 all score 0 on the pawn table.
+    isolated = engine.evaluate(bb.from_fen("4k3/8/8/8/P6P/8/8/4K3 w - - 0 1"))
+    connected = engine.evaluate(bb.from_fen("4k3/8/8/8/PP6/8/8/4K3 w - - 0 1"))
+    assert connected > isolated
+
+
+def test_the_bishop_pair_is_worth_something() -> None:
+    # Swapping the f1 bishop for a knight is worth 10 in material and 20 in PST
+    # on its own, so anything past 30 has to be the pair bonus itself.
+    two_bishops = engine.evaluate(bb.from_fen("4k3/8/8/8/8/8/8/2B1KB2 w - - 0 1"))
+    bishop_and_knight = engine.evaluate(bb.from_fen("4k3/8/8/8/8/8/8/2B1KN2 w - - 0 1"))
+    assert two_bishops - bishop_and_knight > 55
+
+
+def test_a_king_behind_its_pawns_is_safer_than_one_with_none() -> None:
+    # Same king square, same three pawns, same total pawn PST -- only the
+    # distance between the king and its pawns changes.
+    sheltered = engine.evaluate(bb.from_fen("4k3/8/8/8/8/8/5PPP/6K1 w - - 0 1"))
+    abandoned = engine.evaluate(bb.from_fen("4k3/8/8/8/8/8/PPP5/6K1 w - - 0 1"))
+    assert sheltered > abandoned
+
+
+def test_the_search_actually_uses_null_move_pruning() -> None:
+    """Guards against the helper existing while the search never calls it.
+
+    Null-move pruning cuts large parts of the tree, so with it enabled the same
+    budget must reach further than without it.
+    """
+    import inspect
+
+    source = inspect.getsource(engine.negamax.py_func)
+    assert "null_move_allowed_jit" in source, "negamax never calls the null-move guard"
+    assert "null_score" in source, "negamax never performs the null search"

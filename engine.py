@@ -112,6 +112,113 @@ KING_EG_WHITE = np.array([_KING_ENDGAME[sq ^ 56] for sq in range(64)], dtype=np.
 KING_EG_BLACK = np.array([_KING_ENDGAME[sq] for sq in range(64)], dtype=np.int64)
 
 
+# Pawn structure masks. Built here rather than in the kernel: they never change.
+FILE_MASK = np.zeros(8, dtype=np.uint64)
+ADJACENT_FILES = np.zeros(8, dtype=np.uint64)
+for _f in range(8):
+    FILE_MASK[_f] = np.uint64(sum(1 << (_r * 8 + _f) for _r in range(8)))
+for _f in range(8):
+    _mask = 0
+    if _f > 0:
+        _mask |= int(FILE_MASK[_f - 1])
+    if _f < 7:
+        _mask |= int(FILE_MASK[_f + 1])
+    ADJACENT_FILES[_f] = np.uint64(_mask)
+
+# Squares ahead of a pawn on its own and adjacent files. Empty of enemy pawns
+# means the pawn is passed.
+PASSED_SPAN_WHITE = np.zeros(64, dtype=np.uint64)
+PASSED_SPAN_BLACK = np.zeros(64, dtype=np.uint64)
+for _sq in range(64):
+    _f, _r = _sq % 8, _sq // 8
+    _files = int(FILE_MASK[_f]) | int(ADJACENT_FILES[_f])
+    PASSED_SPAN_WHITE[_sq] = np.uint64(
+        _files & sum(0xFF << (8 * _n) for _n in range(_r + 1, 8)))
+    PASSED_SPAN_BLACK[_sq] = np.uint64(
+        _files & sum(0xFF << (8 * _n) for _n in range(0, _r)))
+
+PASSED_BONUS = np.array([0, 10, 20, 35, 50, 75, 100, 0], dtype=np.int64)
+DOUBLED_PENALTY = 20
+ISOLATED_PENALTY = 15
+BISHOP_PAIR_BONUS = 30
+SHIELD_MISSING_FILE = 10
+SHIELD_NEAR = 15
+SHIELD_FAR = 5
+
+
+@njit(cache=False)
+def pawn_structure(bbs):
+    """Passed, doubled and isolated pawns, from White's point of view."""
+    white_pawns = bbs[0]
+    black_pawns = bbs[6]
+    score = 0
+
+    pawns = white_pawns
+    while pawns:
+        square = bb.lsb_index(pawns)
+        pawns &= pawns - bb.ONE
+        if PASSED_SPAN_WHITE[square] & black_pawns == bb.ZERO:
+            score += PASSED_BONUS[square >> 3]
+    pawns = black_pawns
+    while pawns:
+        square = bb.lsb_index(pawns)
+        pawns &= pawns - bb.ONE
+        if PASSED_SPAN_BLACK[square] & white_pawns == bb.ZERO:
+            score -= PASSED_BONUS[7 - (square >> 3)]
+
+    for file in range(8):
+        white_on_file = 0
+        pawns = white_pawns & FILE_MASK[file]
+        while pawns:
+            pawns &= pawns - bb.ONE
+            white_on_file += 1
+        black_on_file = 0
+        pawns = black_pawns & FILE_MASK[file]
+        while pawns:
+            pawns &= pawns - bb.ONE
+            black_on_file += 1
+
+        if white_on_file > 1:
+            score -= DOUBLED_PENALTY * (white_on_file - 1)
+        if black_on_file > 1:
+            score += DOUBLED_PENALTY * (black_on_file - 1)
+        if white_on_file > 0 and white_pawns & ADJACENT_FILES[file] == bb.ZERO:
+            score -= ISOLATED_PENALTY * white_on_file
+        if black_on_file > 0 and black_pawns & ADJACENT_FILES[file] == bb.ZERO:
+            score += ISOLATED_PENALTY * black_on_file
+
+    return score
+
+
+@njit(cache=False)
+def king_shelter(bbs):
+    """Pawns standing in front of each king, from White's point of view."""
+    score = 0
+    for white in range(2):
+        king = bbs[5] if white == 0 else bbs[11]
+        if king == bb.ZERO:
+            continue
+        square = bb.lsb_index(king)
+        file, rank = square % 8, square // 8
+        pawns = bbs[0] if white == 0 else bbs[6]
+        side = 0
+        for delta in (-1, 0, 1):
+            near_file = file + delta
+            if near_file < 0 or near_file > 7:
+                continue
+            if pawns & FILE_MASK[near_file] == bb.ZERO:
+                side -= SHIELD_MISSING_FILE
+            step = 1 if white == 0 else -1
+            for distance, bonus in ((1, SHIELD_NEAR), (2, SHIELD_FAR)):
+                near_rank = rank + step * distance
+                if 0 <= near_rank <= 7 and (
+                    (pawns >> np.uint64(near_rank * 8 + near_file)) & bb.ONE
+                ):
+                    side += bonus
+        score += side if white == 0 else -side
+    return score
+
+
 @njit(cache=False)
 def evaluate_jit(bbs, state):
     """Score from the side to move's point of view, in centipawns."""
@@ -152,6 +259,24 @@ def evaluate_jit(bbs, state):
                 score -= PIECE_VALUES[piece] + np.int64(table)
             else:
                 score -= PIECE_VALUES[piece] + PST_BLACK[piece][square]
+
+    score += pawn_structure(bbs)
+    score += king_shelter(bbs)
+
+    white_bishops = 0
+    pieces = bbs[2]
+    while pieces:
+        pieces &= pieces - bb.ONE
+        white_bishops += 1
+    black_bishops = 0
+    pieces = bbs[8]
+    while pieces:
+        pieces &= pieces - bb.ONE
+        black_bishops += 1
+    if white_bishops >= 2:
+        score += BISHOP_PAIR_BONUS
+    if black_bishops >= 2:
+        score -= BISHOP_PAIR_BONUS
 
     return score if state[bb.SIDE] == 0 else -score
 
@@ -296,6 +421,34 @@ def pick_move(moves, scores, count, start):
 
 
 @njit(cache=False)
+def null_move_allowed_jit(bbs, state):
+    """Passing is only informative when the side to move has a piece to lose tempo with.
+
+    In check a pass leaves the king capturable and the score is meaningless. In a
+    king-and-pawn ending zugzwang makes passing better than every legal move, so
+    the null search fails high on positions that are actually lost.
+    """
+    white = state[bb.SIDE] == 0
+    if in_check_jit(bbs, white):
+        return False
+    offset = 0 if white else 6
+    return (bbs[offset + 1] | bbs[offset + 2] | bbs[offset + 3] | bbs[offset + 4]) != bb.ZERO
+
+
+def null_move_allowed(position: bb.Position) -> bool:
+    return bool(null_move_allowed_jit(position[0], position[1]))
+
+
+def probe_null_move(position: bb.Position) -> bb.Position:
+    """Apply a null move and hand back the result, for tests."""
+    boards, state = position[0].copy(), position[1].copy()
+    state[bb.EP] = -1
+    state[bb.SIDE] = 1 - state[bb.SIDE]
+    state[bb.HALFMOVE] += 1
+    return boards, state
+
+
+@njit(cache=False)
 def in_check_jit(bbs, white):
     king = bbs[(0 if white else 6) + 5]
     if king == bb.ZERO:
@@ -394,6 +547,24 @@ def negamax(bbs, state, depth, alpha, beta, ply, move_stack, score_stack, undo_s
     if depth <= 0:
         return quiescence(bbs, state, alpha, beta, ply, move_stack, score_stack,
                           undo_stack, counter, killers, history)
+
+    # Null-move pruning: hand the opponent a free move. If we are still above
+    # beta after giving up a tempo, the real moves will not fall below it either.
+    if depth >= 3 and ply > 0 and beta < MATE_BOUND and null_move_allowed_jit(bbs, state):
+        saved_ep = state[bb.EP]
+        state[bb.EP] = -1
+        state[bb.SIDE] = 1 - state[bb.SIDE]
+        null_score = -negamax(bbs, state, depth - 3, -beta, -beta + 1, ply + 1,
+                              move_stack, score_stack, undo_stack, counter, deadline,
+                              timed_out, tt_key, tt_depth, tt_flag, tt_moves, tt_score,
+                              killers, history,
+                              repeat_key, repeat_count_table, root_white)
+        state[bb.SIDE] = 1 - state[bb.SIDE]
+        state[bb.EP] = saved_ep
+        if timed_out[0]:
+            return 0
+        if null_score >= beta:
+            return beta
 
     moves = move_stack[ply]
     scores = score_stack[ply]
