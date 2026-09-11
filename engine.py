@@ -192,7 +192,12 @@ def pawn_structure(bbs):
 
 @njit(cache=False)
 def king_shelter(bbs):
-    """Pawns standing in front of each king, from White's point of view."""
+    """Pawns standing in front of each king, from White's point of view.
+
+    Scale this by game phase before using it: at full strength in an ending it
+    argues the king should hide behind its pawns, which is the opposite of what
+    the endgame king table is telling it to do, and the table is right.
+    """
     score = 0
     for white in range(2):
         king = bbs[5] if white == 0 else bbs[11]
@@ -261,7 +266,7 @@ def evaluate_jit(bbs, state):
                 score -= PIECE_VALUES[piece] + PST_BLACK[piece][square]
 
     score += pawn_structure(bbs)
-    score += king_shelter(bbs)
+    score += np.int64(king_shelter(bbs) * phase)
 
     white_bishops = 0
     pieces = bbs[2]
@@ -279,6 +284,17 @@ def evaluate_jit(bbs, state):
         score -= BISHOP_PAIR_BONUS
 
     return score if state[bb.SIDE] == 0 else -score
+
+
+def king_shelter_scaled(boards: np.ndarray, state: np.ndarray) -> int:
+    """The shelter term as the evaluation actually applies it, phase included."""
+    material = 0
+    for piece in range(6):
+        for colour_offset in (0, 6):
+            pieces = int(boards[colour_offset + piece])
+            material += int(PHASE_WEIGHTS[piece]) * bin(pieces).count("1")
+    phase = min(material, PHASE_MAX) / PHASE_MAX
+    return int(int(king_shelter(boards)) * phase)
 
 
 def evaluate(position: bb.Position) -> int:

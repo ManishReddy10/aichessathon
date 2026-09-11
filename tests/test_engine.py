@@ -264,9 +264,10 @@ def test_the_bishop_pair_is_worth_something() -> None:
 
 def test_a_king_behind_its_pawns_is_safer_than_one_with_none() -> None:
     # Same king square, same three pawns, same total pawn PST -- only the
-    # distance between the king and its pawns changes.
-    sheltered = engine.evaluate(bb.from_fen("4k3/8/8/8/8/8/5PPP/6K1 w - - 0 1"))
-    abandoned = engine.evaluate(bb.from_fen("4k3/8/8/8/8/8/PPP5/6K1 w - - 0 1"))
+    # distance between the king and its pawns changes. Queens stay on so the
+    # game phase is a middlegame, which is the only phase shelter applies in.
+    sheltered = engine.evaluate(bb.from_fen("3qk3/8/8/8/8/8/5PPP/3Q2K1 w - - 0 1"))
+    abandoned = engine.evaluate(bb.from_fen("3qk3/8/8/8/8/8/PPP5/3Q2K1 w - - 0 1"))
     assert sheltered > abandoned
 
 
@@ -281,3 +282,31 @@ def test_the_search_actually_uses_null_move_pruning() -> None:
     source = inspect.getsource(engine.negamax.py_func)
     assert "null_move_allowed_jit" in source, "negamax never calls the null-move guard"
     assert "null_score" in source, "negamax never performs the null search"
+
+
+# --- endgame king activity ------------------------------------------------
+
+
+def test_king_safety_fades_out_in_the_endgame() -> None:
+    """A shelter bonus applied at full strength fights the endgame king table.
+
+    In a pawn ending the king is a fighting piece: it should want the centre,
+    and the shelter term must not argue otherwise.
+    """
+    # Identical king and pawns in both; only the queens differ, so the raw
+    # shelter term is the same and only the phase scaling can change it.
+    middlegame = bb.from_fen("3qk3/8/8/8/8/8/5PPP/3Q2K1 w - - 0 1")
+    endgame = bb.from_fen("4k3/8/8/8/8/8/5PPP/6K1 w - - 0 1")
+    assert engine.king_shelter(middlegame[0]) == engine.king_shelter(endgame[0]), (
+        "test positions differ in more than the phase"
+    )
+    assert abs(engine.king_shelter_scaled(*middlegame)) > abs(
+        engine.king_shelter_scaled(*endgame)
+    ), "shelter must weigh less once the pieces come off"
+
+
+def test_the_endgame_king_walks_to_the_centre() -> None:
+    """The measured symptom: kings sat 2.5 squares from the centre in drawn endgames."""
+    centred = engine.evaluate(bb.from_fen("8/5ppp/8/8/4K3/8/5PPP/4r3 w - - 0 1"))
+    edged = engine.evaluate(bb.from_fen("8/5ppp/8/8/8/8/5PPP/K3r3 w - - 0 1"))
+    assert centred > edged + 60, "centralising the king barely scores better"
