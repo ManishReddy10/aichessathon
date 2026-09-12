@@ -34,4 +34,13 @@ ignore = ["N818"]
 
 [tool.mypy]
 strict = true
-files = ["agent.py", "harness"]
+files = ["agent.py", "bitboard.py", "engine.py", "harness"]
+
+# numba compiles these per call-site from the actual argument types, so a Python
+# annotation neither constrains nor documents them -- every kernel parameter is
+# "whatever numpy array numba specialised on". Everything else stays strict, and
+# the Python-facing wrappers in both modules are annotated normally.
+[[tool.mypy.overrides]]
+module = ["bitboard", "engine"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
